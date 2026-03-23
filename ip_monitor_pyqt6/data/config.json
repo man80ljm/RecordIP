@@ -1,0 +1,17 @@
+{
+  "excel_path": "data/ip_log.xlsx",
+  "ip_check_url": "https://api.ipify.org?format=json",
+  "ip_check_urls": [
+    {
+      "name": "主源(ipify)",
+      "url": "https://api.ipify.org?format=json"
+    },
+    {
+      "name": "网页对齐源(ifconfig)",
+      "url": "https://ifconfig.me/ip"
+    }
+  ],
+  "ip_info_url_template": "http://ip-api.com/json/{ip}?lang=zh-CN",
+  "auto_open_url": "https://whatismyipaddress.com",
+  "auto_detect_interval_minutes": 5
+}
