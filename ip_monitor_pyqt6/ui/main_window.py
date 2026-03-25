@@ -2,8 +2,9 @@ import os
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QStatusBar,
     QSystemTrayIcon,
     QMenu,
@@ -28,6 +30,135 @@ from core.config_service import ConfigService
 from core.excel_service import ExcelService, ExcelServiceError
 from core.ip_service import IPService, IPServiceError
 from core.logger_service import LoggerService
+
+
+class DetectWorker(QObject):
+    """后台执行检测逻辑，避免阻塞 UI 主线程。"""
+
+    succeeded = pyqtSignal(dict)
+    failed = pyqtSignal(str, bool)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        excel_path: Path,
+        source_configs: list[dict[str, str]],
+        fallback_source_configs: list[dict[str, str]] | None,
+        ip_info_url_template: str,
+        ip_service: IPService,
+        excel_service: ExcelService,
+    ):
+        super().__init__()
+        self.excel_path = excel_path
+        self.source_configs = source_configs
+        self.fallback_source_configs = fallback_source_configs
+        self.ip_info_url_template = ip_info_url_template
+        self.ip_service = ip_service
+        self.excel_service = excel_service
+
+    @pyqtSlot()
+    def run(self) -> None:
+        """在线程中执行检测并通过信号返回结果。"""
+        try:
+            logs: list[str] = []
+            used_fallback = False
+            try:
+                dual_result = self.ip_service.fetch_dual_source_ipv4(self.source_configs)
+            except IPServiceError as primary_exc:
+                if not self.fallback_source_configs:
+                    raise
+                logs.append(f"默认源不可达，尝试国内源回退: {primary_exc}")
+                dual_result = self.ip_service.fetch_dual_source_ipv4(self.fallback_source_configs)
+                used_fallback = True
+
+            primary_ip = dual_result["primary_ip"]
+            web_ip = dual_result["web_ip"]
+            is_consistent = bool(dual_result["is_consistent"])
+
+            # IP 信息查询失败时不终止主流程，优先保证 IP 检测可用。
+            try:
+                ip_info = self.ip_service.fetch_ip_info(self.ip_info_url_template, web_ip)
+            except IPServiceError as info_exc:
+                logs.append(f"IP 详情查询失败，已忽略: {info_exc}")
+                ip_info = {
+                    "country": "",
+                    "region": "",
+                    "city": "",
+                    "isp": "",
+                    "org": "",
+                    "as": "",
+                    "timezone": "",
+                }
+
+            last_ips = self.excel_service.get_last_ips(self.excel_path)
+            last_primary = last_ips.get("primary_ip", "")
+            last_web = last_ips.get("web_ip", "")
+
+            # 任意来源发生变化时，均写入 Excel 作为新记录。
+            changed = (primary_ip != last_primary) or (web_ip != last_web)
+
+            if changed:
+                is_first = not last_primary and not last_web
+                note_prefix = "首次记录" if is_first else "IP发生变化"
+                consistency_text = "一致" if is_consistent else "不一致"
+                note = f"{note_prefix}; 主源={primary_ip}; 网页源={web_ip}; 双源{consistency_text}"
+                record = {
+                    "记录时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "主源IP": primary_ip,
+                    "网页源IP": web_ip,
+                    "国家": ip_info.get("country", ""),
+                    "地区": ip_info.get("region", ""),
+                    "城市": ip_info.get("city", ""),
+                    "ISP": ip_info.get("isp", ""),
+                    "组织": ip_info.get("org", ""),
+                    "AS": ip_info.get("as", ""),
+                    "时区": ip_info.get("timezone", ""),
+                    "双源一致": "是" if is_consistent else "否",
+                    "是否变化": "是",
+                    "备注": note,
+                }
+                self.excel_service.append_record(self.excel_path, record)
+                status_text = "已变化并写入Excel"
+                if is_first:
+                    logs.append(f"首次记录: 主源={primary_ip} | 网页源={web_ip}")
+                else:
+                    logs.append(
+                        f"IP 变化: 主源 {last_primary or '-'} → {primary_ip} | "
+                        f"网页源 {last_web or '-'} → {web_ip}"
+                    )
+                logs.append("已写入新记录到 Excel")
+                display_last_web = web_ip
+            else:
+                status_text = "未变化"
+                logs.append(f"IP 未变化: 主源={primary_ip} | 网页源={web_ip}")
+                display_last_web = last_web
+
+            logs.append(
+                f"双源: {dual_result['primary_name']}={primary_ip} | "
+                f"{dual_result['web_name']}={web_ip} | "
+                f"一致: {'是' if is_consistent else '否'}"
+            )
+            if used_fallback:
+                logs.append("本次检测已自动切换到国内源")
+
+            payload: dict[str, Any] = {
+                "status_text": status_text,
+                "primary_ip": primary_ip,
+                "web_ip": web_ip,
+                "display_last_web": display_last_web,
+                "isp": ip_info.get("isp", "-") or "-",
+                "region": ip_info.get("region", "") or "-",
+                "city": ip_info.get("city", "") or "-",
+                "logs": logs,
+            }
+            self.succeeded.emit(payload)
+        except (IPServiceError, ExcelServiceError, ValueError) as exc:
+            self.failed.emit(str(exc), False)
+        except Exception as exc:
+            self.failed.emit(f"发生未预期错误: {exc}", True)
+        finally:
+            self.finished.emit()
 
 
 class MainWindow(QMainWindow):
@@ -49,13 +180,17 @@ class MainWindow(QMainWindow):
         self._allow_close = False
         self._tray_tip_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
+        self._is_detecting = False
+        self._pending_open_site = False
+        self._detect_thread: QThread | None = None
+        self._detect_worker: DetectWorker | None = None
 
         self.setWindowTitle("公网 IP 监测工具 - ip_monitor_pyqt6")
         app_icon = QApplication.windowIcon()
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
-        self.setMinimumSize(820, 600)
-        self.resize(820, 600)
+        self.setMinimumSize(820, 560)
+        self.resize(820, 560)
 
         self._init_ui()
         self._apply_styles()
@@ -180,12 +315,21 @@ class MainWindow(QMainWindow):
         self.set_excel_btn.setObjectName("secondaryButton")
         self.exit_btn = QPushButton("退出")
         self.exit_btn.setObjectName("secondaryButton")
+        self.interval_label = QLabel("自动(分)")
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(0, 1440)
+        self.interval_spin.setSingleStep(1)
+        self.interval_spin.setValue(int(self.config.get("auto_detect_interval_minutes", 5)))
+        self.interval_spin.setFixedHeight(36)
+        self.interval_spin.setFixedWidth(92)
+        self.interval_spin.setToolTip("0 表示关闭自动检测")
 
         self.detect_btn.setFixedHeight(36)
         self.open_excel_btn.setFixedHeight(36)
         self.open_site_btn.setFixedHeight(36)
         self.set_excel_btn.setFixedHeight(36)
         self.exit_btn.setFixedHeight(36)
+        self.interval_label.setFixedHeight(36)
 
         self.detect_btn.setMinimumWidth(140)
         self.open_excel_btn.setMinimumWidth(116)
@@ -197,12 +341,15 @@ class MainWindow(QMainWindow):
         self.open_excel_btn.clicked.connect(self.open_excel)
         self.open_site_btn.clicked.connect(self.open_site)
         self.set_excel_btn.clicked.connect(self.set_excel_path)
+        self.interval_spin.valueChanged.connect(self.set_auto_detect_interval)
         self.exit_btn.clicked.connect(self.close)
 
         button_layout.addWidget(self.detect_btn)
         button_layout.addWidget(self.open_excel_btn)
         button_layout.addWidget(self.open_site_btn)
         button_layout.addWidget(self.set_excel_btn)
+        button_layout.addWidget(self.interval_label)
+        button_layout.addWidget(self.interval_spin)
         button_layout.addStretch(1)
         button_layout.addWidget(self.exit_btn)
 
@@ -347,6 +494,17 @@ class MainWindow(QMainWindow):
             QPushButton#secondaryButton:pressed {
                 background: #e9eef7;
             }
+            QSpinBox {
+                border: 1px solid #cfd7e5;
+                border-radius: 8px;
+                background: #ffffff;
+                padding: 4px 8px;
+                color: #1f2937;
+            }
+            QSpinBox::up-button,
+            QSpinBox::down-button {
+                width: 16px;
+            }
             QStatusBar {
                 border-top: 1px solid #d7dfeb;
                 background: #f8fafc;
@@ -471,9 +629,8 @@ class MainWindow(QMainWindow):
             return short_text
         return name
 
-    def _get_ip_sources(self) -> list[dict[str, str]]:
-        """读取并规范化双源 IP 配置。"""
-        source_list = self.config.get("ip_check_urls", [])
+    def _normalize_source_list(self, source_list: Any) -> list[dict[str, str]]:
+        """读取并规范化双源 IP 配置列表。"""
 
         valid_sources: list[dict[str, str]] = []
         if isinstance(source_list, list):
@@ -486,8 +643,15 @@ class MainWindow(QMainWindow):
                     continue
                 valid_sources.append({"name": name or "来源", "url": url})
 
+        return valid_sources
+
+    def _get_ip_sources(self, config_key: str = "ip_check_urls") -> list[dict[str, str]]:
+        """读取并规范化指定键对应的双源 IP 配置。"""
+        source_list = self.config.get(config_key, [])
+        valid_sources = self._normalize_source_list(source_list)
+
         # 向后兼容：没有双源配置时使用旧字段作为主源。
-        if not valid_sources:
+        if not valid_sources and config_key == "ip_check_urls":
             legacy_url = str(self.config.get("ip_check_url", "")).strip()
             if legacy_url:
                 valid_sources.append({"name": "主源(ipify)", "url": legacy_url})
@@ -525,6 +689,27 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.logger.error(f"保存配置失败: {exc}")
             QMessageBox.critical(self, "错误", f"保存配置失败:\n{exc}")
+
+    def set_auto_detect_interval(self, interval_min: int) -> None:
+        """设置自动检测间隔（分钟），0 表示关闭自动检测。"""
+        interval_min = max(0, int(interval_min))
+        old_interval = int(self.config.get("auto_detect_interval_minutes", 0))
+        if interval_min == old_interval:
+            return
+
+        self.config["auto_detect_interval_minutes"] = interval_min
+        self._setup_auto_timer()
+        self._refresh_statusbar()
+
+        try:
+            self.config_service.save_config(self.config)
+            if interval_min > 0:
+                self.logger.info(f"自动检测间隔已更新为每 {interval_min} 分钟")
+            else:
+                self.logger.info("自动检测已关闭（仅手动检测）")
+        except OSError as exc:
+            self.logger.error(f"保存自动检测设置失败: {exc}")
+            QMessageBox.warning(self, "提示", f"保存自动检测设置失败:\n{exc}")
 
     def open_excel(self) -> None:
         """打开 Excel 文件。"""
@@ -564,102 +749,97 @@ class MainWindow(QMainWindow):
 
     def detect_now(self, *, open_site: bool = False) -> None:
         """执行一次 IP 检测流程。"""
+        if self._is_detecting:
+            self.logger.warning("检测任务仍在执行中，已跳过本次请求")
+            return
+
         self.detect_btn.setEnabled(False)
         self._set_status_text("检测中...")
         self.logger.info("开始执行 IP 检测")
-
-        excel_path = self.config_service.get_excel_path(self.config)
-
         try:
             source_configs = self._get_ip_sources()
+            fallback_source_configs: list[dict[str, str]] | None = None
+            if bool(self.config.get("enable_cn_fallback", True)):
+                fallback_source_configs = self._normalize_source_list(
+                    self.config.get("ip_check_urls_cn", [])
+                )
+                if len(fallback_source_configs) < 2:
+                    fallback_source_configs = None
             ip_info_url_template = str(self.config.get("ip_info_url_template", "")).strip()
+            excel_path = self.config_service.get_excel_path(self.config)
 
             if not ip_info_url_template:
                 raise ValueError("配置缺少 IP 详情查询地址")
-
-            dual_result = self.ip_service.fetch_dual_source_ipv4(source_configs)
-
-            primary_ip = dual_result["primary_ip"]
-            web_ip = dual_result["web_ip"]
-            is_consistent = bool(dual_result["is_consistent"])
-
-            # 使用网页对齐源查询 IP 归属信息，结果与 whatismyipaddress 更贴近。
-            ip_info = self.ip_service.fetch_ip_info(ip_info_url_template, web_ip)
-
-            last_ips = self.excel_service.get_last_ips(excel_path)
-            last_primary = last_ips.get("primary_ip", "")
-            last_web = last_ips.get("web_ip", "")
-
-            # 任意来源发生变化时，均写入 Excel 作为新记录。
-            changed = (primary_ip != last_primary) or (web_ip != last_web)
-
-            if changed:
-                is_first = not last_primary and not last_web
-                note_prefix = "首次记录" if is_first else "IP发生变化"
-                consistency_text = "一致" if is_consistent else "不一致"
-                note = f"{note_prefix}; 主源={primary_ip}; 网页源={web_ip}; 双源{consistency_text}"
-                record = {
-                    "记录时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "主源IP": primary_ip,
-                    "网页源IP": web_ip,
-                    "国家": ip_info.get("country", ""),
-                    "地区": ip_info.get("region", ""),
-                    "城市": ip_info.get("city", ""),
-                    "ISP": ip_info.get("isp", ""),
-                    "组织": ip_info.get("org", ""),
-                    "AS": ip_info.get("as", ""),
-                    "时区": ip_info.get("timezone", ""),
-                    "双源一致": "是" if is_consistent else "否",
-                    "是否变化": "是",
-                    "备注": note,
-                }
-                self.excel_service.append_record(excel_path, record)
-                status_text = "已变化并写入Excel"
-                if is_first:
-                    self.logger.info(f"首次记录: 主源={primary_ip} | 网页源={web_ip}")
-                else:
-                    self.logger.info(
-                        f"IP 变化: 主源 {last_primary or '-'} → {primary_ip} | "
-                        f"网页源 {last_web or '-'} → {web_ip}"
-                    )
-                self.logger.info("已写入新记录到 Excel")
-                display_last_web = web_ip
-            else:
-                status_text = "未变化"
-                self.logger.info(
-                    f"IP 未变化: 主源={primary_ip} | 网页源={web_ip}"
-                )
-                display_last_web = last_web
-
-            self.current_ip_value.setText(web_ip)
-            self.primary_ip_value.setText(primary_ip)
-            self.last_ip_value.setText(display_last_web if display_last_web else "-")
-            self.isp_value.setText(ip_info.get("isp", "-") or "-")
-
-            self.logger.info(
-                f"双源: {dual_result['primary_name']}={primary_ip} | "
-                f"{dual_result['web_name']}={web_ip} | "
-                f"一致: {'是' if is_consistent else '否'}"
-            )
-
-            region = ip_info.get("region", "") or "-"
-            city = ip_info.get("city", "") or "-"
-            self.location_value.setText(f"{region} / {city}")
-            self._set_status_text(status_text)
 
         except (IPServiceError, ExcelServiceError, ValueError) as exc:
             self._set_status_text("检测失败")
             self.primary_ip_value.setText("-")
             self.logger.error(str(exc))
             QMessageBox.warning(self, "检测失败", str(exc))
-        except Exception as exc:
-            self._set_status_text("检测失败")
-            self.primary_ip_value.setText("-")
-            self.logger.error(f"发生未预期错误: {exc}")
-            QMessageBox.critical(self, "错误", f"发生未预期错误:\n{exc}")
-        finally:
             self.last_check_time_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._refresh_statusbar()
-            if open_site:
-                self._open_auto_site(reason="手动")
             self.detect_btn.setEnabled(True)
+            return
+
+        self._pending_open_site = open_site
+        self._is_detecting = True
+
+        self._detect_thread = QThread(self)
+        self._detect_worker = DetectWorker(
+            excel_path=excel_path,
+            source_configs=source_configs,
+            fallback_source_configs=fallback_source_configs,
+            ip_info_url_template=ip_info_url_template,
+            ip_service=self.ip_service,
+            excel_service=self.excel_service,
+        )
+        self._detect_worker.moveToThread(self._detect_thread)
+
+        self._detect_thread.started.connect(self._detect_worker.run)
+        self._detect_worker.succeeded.connect(self._on_detect_success)
+        self._detect_worker.failed.connect(self._on_detect_failed)
+        self._detect_worker.finished.connect(self._on_detect_finished)
+        self._detect_worker.finished.connect(self._detect_thread.quit)
+        self._detect_worker.finished.connect(self._detect_worker.deleteLater)
+        self._detect_thread.finished.connect(self._detect_thread.deleteLater)
+
+        self._detect_thread.start()
+
+    def _on_detect_success(self, payload: dict[str, Any]) -> None:
+        """在主线程处理检测成功结果并更新 UI。"""
+        self.current_ip_value.setText(str(payload.get("web_ip", "-") or "-"))
+        self.primary_ip_value.setText(str(payload.get("primary_ip", "-") or "-"))
+        self.last_ip_value.setText(str(payload.get("display_last_web", "-") or "-"))
+        self.isp_value.setText(str(payload.get("isp", "-") or "-"))
+        region = str(payload.get("region", "-") or "-")
+        city = str(payload.get("city", "-") or "-")
+        self.location_value.setText(f"{region} / {city}")
+        self._set_status_text(str(payload.get("status_text", "未变化")))
+
+        for line in payload.get("logs", []):
+            self.logger.info(str(line))
+
+    def _on_detect_failed(self, message: str, is_unexpected: bool) -> None:
+        """在主线程处理检测失败结果并提示用户。"""
+        self._set_status_text("检测失败")
+        self.primary_ip_value.setText("-")
+        self.logger.error(message)
+        if is_unexpected:
+            QMessageBox.critical(self, "错误", f"发生未预期错误:\n{message}")
+        else:
+            QMessageBox.warning(self, "检测失败", message)
+
+    def _on_detect_finished(self) -> None:
+        """收尾逻辑：恢复按钮状态、更新时间与状态栏。"""
+        self._is_detecting = False
+        self.last_check_time_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._refresh_statusbar()
+        self.detect_btn.setEnabled(True)
+
+        should_open_site = self._pending_open_site
+        self._pending_open_site = False
+        if should_open_site:
+            self._open_auto_site(reason="手动")
+
+        self._detect_worker = None
+        self._detect_thread = None

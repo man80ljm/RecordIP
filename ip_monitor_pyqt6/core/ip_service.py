@@ -1,4 +1,5 @@
 from typing import Any
+import re
 
 import requests
 
@@ -61,8 +62,25 @@ class IPService:
         content_type = response.headers.get("Content-Type", "")
         if "application/json" in content_type:
             data = response.json()
-            return str(data.get("ip", "")).strip()
-        return response.text.strip()
+            ip = str(data.get("ip", "")).strip()
+            if ip:
+                return ip
+
+            # 兼容一些接口返回字段不叫 ip 的情况。
+            for key in ("query", "ipAddress", "origin"):
+                value = str(data.get(key, "")).strip()
+                if value:
+                    match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", value)
+                    if match:
+                        return match.group(0)
+            return ""
+
+        # 兼容纯文本接口，如 "当前 IP：1.2.3.4 来自于..."。
+        text = response.text.strip()
+        match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+        if match:
+            return match.group(0)
+        return text
 
     def fetch_ip_info(self, ip_info_url_template: str, ip: str) -> dict[str, Any]:
         """根据 IP 获取归属地和运营商信息。"""

@@ -15,6 +15,13 @@ class ConfigService:
             {"name": "主源(ipify)", "url": "https://api.ipify.org?format=json"},
             {"name": "网页对齐源(ifconfig)", "url": "https://ifconfig.me/ip"},
         ],
+        # 国内可访问回退源（当默认双源不可达时使用）。
+        "ip_check_urls_cn": [
+            {"name": "国内主源(3322)", "url": "https://ip.3322.net"},
+            {"name": "国内网页源(ipip)", "url": "https://myip.ipip.net"},
+        ],
+        # 是否启用国内源自动回退。
+        "enable_cn_fallback": True,
         "ip_info_url_template": "http://ip-api.com/json/{ip}?lang=zh-CN",
         "auto_open_url": "https://whatismyipaddress.com",
         # 自动检测间隔（分钟），0 表示禁用自动检测。
@@ -65,6 +72,10 @@ class ConfigService:
                 {"name": "主源(ipify)", "url": legacy_url},
                 {"name": "网页对齐源(ifconfig)", "url": "https://ifconfig.me/ip"},
             ]
+
+        # 兼容旧版配置: 当未配置国内回退双源时，自动补齐默认值。
+        if not self._is_valid_source_list(config.get("ip_check_urls_cn")):
+            config["ip_check_urls_cn"] = list(self.DEFAULT_CONFIG["ip_check_urls_cn"])
 
         # 自动回写，确保新增字段被持久化。
         self.save_config(config)
