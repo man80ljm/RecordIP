@@ -179,3 +179,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local runtime data
+ip_monitor_pyqt6/data/config.json
+ip_monitor_pyqt6/data/ip_log.xlsx
