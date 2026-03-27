@@ -32,6 +32,24 @@ from core.ip_service import IPService, IPServiceError
 from core.logger_service import LoggerService
 
 
+class LatencyWorker(QObject):
+    """后台执行延迟测试，避免阻塞 UI 主线程。"""
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, *, url: str, ip_service: IPService, count: int = 3):
+        super().__init__()
+        self.url = url
+        self.ip_service = ip_service
+        self.count = count
+
+    @pyqtSlot()
+    def run(self) -> None:
+        """在线程中执行延迟测试并通过信号返回结果。"""
+        result = self.ip_service.measure_latency(self.url, self.count)
+        self.finished.emit(result)
+
+
 class DetectWorker(QObject):
     """后台执行检测逻辑，避免阻塞 UI 主线程。"""
 
@@ -150,6 +168,7 @@ class DetectWorker(QObject):
                 "isp": ip_info.get("isp", "-") or "-",
                 "region": ip_info.get("region", "") or "-",
                 "city": ip_info.get("city", "") or "-",
+                "country": ip_info.get("country", ""),
                 "logs": logs,
             }
             self.succeeded.emit(payload)
@@ -177,6 +196,7 @@ class MainWindow(QMainWindow):
         self.logger.add_listener(self.append_log)
 
         self.last_check_time_text = "未检测"
+        self._last_detected_country = ""
         self._allow_close = False
         self._tray_tip_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
@@ -184,6 +204,8 @@ class MainWindow(QMainWindow):
         self._pending_open_site = False
         self._detect_thread: QThread | None = None
         self._detect_worker: DetectWorker | None = None
+        self._latency_thread: QThread | None = None
+        self._latency_worker: LatencyWorker | None = None
 
         self.setWindowTitle("公网 IP 监测工具 - ip_monitor_pyqt6")
         app_icon = QApplication.windowIcon()
@@ -291,6 +313,11 @@ class MainWindow(QMainWindow):
         bottom_cards_layout.addWidget(self._create_info_card("ISP", self.isp_value), 0, 1)
         bottom_cards_layout.addWidget(self._create_info_card("地区 / 城市", self.location_value), 0, 2)
 
+        # 延迟显示卡片。
+        self.latency_value = QLabel("- ms")
+        self.latency_value.setObjectName("cardValue")
+        bottom_cards_layout.addWidget(self._create_info_card("网络延迟", self.latency_value), 0, 3)
+
         info_layout.addLayout(top_cards_layout)
         info_layout.addLayout(bottom_cards_layout)
 
@@ -304,7 +331,8 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_output)
 
         button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
+        button_layout.setSpacing(6)
+        button_layout.setContentsMargins(0, 0, 0, 0)
         self.detect_btn = QPushButton("立即检测")
         self.detect_btn.setObjectName("primaryButton")
         self.open_excel_btn = QPushButton("打开Excel")
@@ -313,6 +341,8 @@ class MainWindow(QMainWindow):
         self.open_site_btn.setObjectName("secondaryButton")
         self.set_excel_btn = QPushButton("设置Excel路径")
         self.set_excel_btn.setObjectName("secondaryButton")
+        self.latency_btn = QPushButton("测延迟")
+        self.latency_btn.setObjectName("secondaryButton")
         self.exit_btn = QPushButton("退出")
         self.exit_btn.setObjectName("secondaryButton")
         self.interval_label = QLabel("自动(分)")
@@ -328,23 +358,36 @@ class MainWindow(QMainWindow):
         self.open_excel_btn.setFixedHeight(36)
         self.open_site_btn.setFixedHeight(36)
         self.set_excel_btn.setFixedHeight(36)
+        self.latency_btn.setFixedHeight(36)
         self.exit_btn.setFixedHeight(36)
         self.interval_label.setFixedHeight(36)
 
-        self.detect_btn.setMinimumWidth(140)
-        self.open_excel_btn.setMinimumWidth(116)
-        self.open_site_btn.setMinimumWidth(116)
-        self.set_excel_btn.setMinimumWidth(132)
-        self.exit_btn.setMinimumWidth(96)
+        self.detect_btn.setMinimumWidth(120)
+        self.latency_btn.setMinimumWidth(80)
+        self.open_excel_btn.setMinimumWidth(100)
+        self.open_site_btn.setMinimumWidth(100)
+        self.set_excel_btn.setMinimumWidth(110)
+        self.exit_btn.setMinimumWidth(80)
+
+        self.interval_label = QLabel("自动(分)")
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(0, 1440)
+        self.interval_spin.setSingleStep(1)
+        self.interval_spin.setValue(int(self.config.get("auto_detect_interval_minutes", 5)))
+        self.interval_spin.setFixedHeight(36)
+        self.interval_spin.setFixedWidth(92)
+        self.interval_spin.setToolTip("0 表示关闭自动检测")
 
         self.detect_btn.clicked.connect(lambda: self.detect_now(open_site=True))
         self.open_excel_btn.clicked.connect(self.open_excel)
         self.open_site_btn.clicked.connect(self.open_site)
         self.set_excel_btn.clicked.connect(self.set_excel_path)
+        self.latency_btn.clicked.connect(self.test_latency)
         self.interval_spin.valueChanged.connect(self.set_auto_detect_interval)
         self.exit_btn.clicked.connect(self.close)
 
         button_layout.addWidget(self.detect_btn)
+        button_layout.addWidget(self.latency_btn)
         button_layout.addWidget(self.open_excel_btn)
         button_layout.addWidget(self.open_site_btn)
         button_layout.addWidget(self.set_excel_btn)
@@ -734,6 +777,68 @@ class MainWindow(QMainWindow):
         """手动打开网站。"""
         self._open_auto_site(reason="手动")
 
+    def test_latency(self) -> None:
+        """测试网络延迟。"""
+        if self._latency_thread is not None:
+            self.logger.warning("延迟测试正在进行中，请稍候")
+            return
+
+        # 根据上次检测的国家选择测试目标。
+        is_china = self._last_detected_country in ("china", "中国", "cn")
+
+        if is_china:
+            latency_url = str(self.config.get("latency_test_url_cn", "https://www.baidu.com")).strip()
+            test_name = "国内"
+        else:
+            latency_url = str(self.config.get("latency_test_url", "https://www.google.com")).strip()
+            test_name = "国外"
+
+        if not latency_url:
+            latency_url = "https://www.google.com" if not is_china else "https://www.baidu.com"
+
+        self.latency_btn.setEnabled(False)
+        self.latency_value.setText("测试中...")
+        self.logger.info(f"开始延迟测试({test_name}): {latency_url}")
+
+        self._latency_thread = QThread(self)
+        self._latency_worker = LatencyWorker(
+            url=latency_url,
+            ip_service=self.ip_service,
+            count=3,
+        )
+        self._latency_worker.moveToThread(self._latency_thread)
+
+        self._latency_thread.started.connect(self._latency_worker.run)
+        self._latency_worker.finished.connect(self._on_latency_finished)
+        self._latency_worker.finished.connect(self._latency_thread.quit)
+        self._latency_worker.finished.connect(self._latency_worker.deleteLater)
+        self._latency_thread.finished.connect(self._latency_thread.deleteLater)
+
+        self._latency_thread.start()
+
+    def _on_latency_finished(self, result: dict[str, Any]) -> None:
+        """延迟测试完成回调。"""
+        self.latency_btn.setEnabled(True)
+        self._latency_worker = None
+        self._latency_thread = None
+
+        if result.get("error"):
+            self.latency_value.setText("失败")
+            self.logger.error(f"延迟测试失败: {result['error']}")
+            return
+
+        avg = result.get("avg")
+        min_val = result.get("min")
+        max_val = result.get("max")
+
+        if avg is not None:
+            self.latency_value.setText(f"{avg} ms")
+            self.logger.info(
+                f"延迟测试完成: 平均 {avg}ms (最小 {min_val}ms, 最大 {max_val}ms)"
+            )
+        else:
+            self.latency_value.setText("- ms")
+
     def _open_auto_site(self, reason: str) -> None:
         """打开配置中的网站地址。"""
         url = str(self.config.get("auto_open_url", "https://whatismyipaddress.com")).strip()
@@ -744,6 +849,28 @@ class MainWindow(QMainWindow):
         try:
             webbrowser.open(url, new=2)
             self.logger.info(f"已打开网站({reason}): {url}")
+        except OSError as exc:
+            self.logger.error(f"打开网站失败: {exc}")
+
+    def _open_auto_site_by_country(self, reason: str) -> None:
+        """根据 IP 归属国家选择跳转链接。"""
+        # 判断是否为国内 IP（中国或空值时默认国外）。
+        is_china = self._last_detected_country in ("china", "中国", "cn")
+
+        if is_china:
+            url = str(self.config.get("auto_open_url_cn", "https://myip.ipip.net/")).strip()
+            site_name = "国内站点"
+        else:
+            url = str(self.config.get("auto_open_url", "https://whatismyipaddress.com")).strip()
+            site_name = "国外站点"
+
+        if not url:
+            self.logger.warning("网站地址为空，跳过打开")
+            return
+
+        try:
+            webbrowser.open(url, new=2)
+            self.logger.info(f"已打开网站({reason}, {site_name}): {url}")
         except OSError as exc:
             self.logger.error(f"打开网站失败: {exc}")
 
@@ -816,6 +943,9 @@ class MainWindow(QMainWindow):
         self.location_value.setText(f"{region} / {city}")
         self._set_status_text(str(payload.get("status_text", "未变化")))
 
+        # 保存国家信息，用于决定跳转链接。
+        self._last_detected_country = str(payload.get("country", "") or "").lower()
+
         for line in payload.get("logs", []):
             self.logger.info(str(line))
 
@@ -839,7 +969,7 @@ class MainWindow(QMainWindow):
         should_open_site = self._pending_open_site
         self._pending_open_site = False
         if should_open_site:
-            self._open_auto_site(reason="手动")
+            self._open_auto_site_by_country(reason="手动")
 
         self._detect_worker = None
         self._detect_thread = None

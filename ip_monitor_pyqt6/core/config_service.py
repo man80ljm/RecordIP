@@ -24,6 +24,12 @@ class ConfigService:
         "enable_cn_fallback": True,
         "ip_info_url_template": "http://ip-api.com/json/{ip}?lang=zh-CN",
         "auto_open_url": "https://whatismyipaddress.com",
+        # 国内 IP 时跳转的网站。
+        "auto_open_url_cn": "https://myip.ipip.net/",
+        # 延迟测试目标 URL（默认 Google，适合 VPN 用户）。
+        "latency_test_url": "https://www.google.com",
+        # 国内 IP 时的延迟测试目标。
+        "latency_test_url_cn": "https://www.baidu.com",
         # 自动检测间隔（分钟），0 表示禁用自动检测。
         "auto_detect_interval_minutes": 5,
     }

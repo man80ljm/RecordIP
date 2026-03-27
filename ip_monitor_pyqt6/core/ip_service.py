@@ -1,5 +1,6 @@
 from typing import Any
 import re
+import time
 
 import requests
 
@@ -13,6 +14,50 @@ class IPService:
 
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
+
+    def measure_latency(self, url: str, count: int = 3) -> dict[str, Any]:
+        """测量到指定 URL 的网络延迟（毫秒）。
+
+        Args:
+            url: 目标 URL
+            count: 测量次数，默认 3 次
+
+        Returns:
+            包含延迟信息的字典：min, max, avg, success_count, fail_count
+        """
+        latencies: list[float] = []
+        fail_count = 0
+
+        for _ in range(count):
+            try:
+                start = time.perf_counter()
+                response = requests.head(url, timeout=self.timeout, allow_redirects=True)
+                end = time.perf_counter()
+                response.raise_for_status()
+                latencies.append((end - start) * 1000)  # 转换为毫秒
+            except requests.RequestException:
+                fail_count += 1
+
+        if not latencies:
+            return {
+                "url": url,
+                "min": None,
+                "max": None,
+                "avg": None,
+                "success_count": 0,
+                "fail_count": fail_count,
+                "error": "所有请求均失败",
+            }
+
+        return {
+            "url": url,
+            "min": round(min(latencies), 1),
+            "max": round(max(latencies), 1),
+            "avg": round(sum(latencies) / len(latencies), 1),
+            "success_count": len(latencies),
+            "fail_count": fail_count,
+            "error": None,
+        }
 
     def fetch_current_ipv4(self, ip_check_url: str) -> str:
         """获取当前公网 IPv4。"""
